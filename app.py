@@ -30,57 +30,57 @@ def get_gemini_model():
         st.error("Secrets 設定錯誤：找不到 GEMINI_API_KEY")
         st.stop()
 
-# --- 2. 核心：AI 股票識別 (純 AI + 強力解析版) ---
+# --- 2. 核心：AI 股票識別 (v9 強制 JSON 版) ---
 @st.cache_data(ttl=3600)
 def identify_stock_with_ai(query):
     """輸入中文名，回傳標準代號 (純 AI 處理)"""
     if not query or str(query).lower() == "nan": return None
     
-    # 簡單防呆：如果是 4 碼數字，直接當作台股 (這不算 VIP 名單，是基本邏輯)
     q = str(query).strip()
+    # 基本防呆
     if q.isdigit() and len(q) == 4:
         return {"ticker": f"{q}.TW", "name": q, "type": "TW Stock"}
 
     model = get_gemini_model()
     
-    # ★ 改良版 Prompt：嚴格規定格式，並教它 Crypto 要加 -USD
+    # ★ Prompt 大升級：給範例 (Few-Shot) + 強制 JSON 結構
     prompt = f"""
-    You are a financial symbol resolver. Convert the user input into a valid Yahoo Finance ticker.
-    
+    Role: You are a strict JSON data converter for financial tickers (Yahoo Finance).
     User Input: "{query}"
     
-    Strict Rules:
-    1. For **Taiwan Stocks**, append ".TW" (e.g., 2330 -> 2330.TW).
-    2. For **Cryptocurrencies**, you MUST append "-USD" (e.g., ETH -> ETH-USD, BTC -> BTC-USD).
-    3. For **US Stocks**, use the standard ticker (e.g., NVDA, AAPL).
-    4. Return ONLY a valid JSON object. No markdown, no explanation.
+    Instructions:
+    1. Identify the company or asset from the input.
+    2. Convert it to the CORRECT Yahoo Finance ticker.
+    3. **Taiwan Stocks**: Use 4 digits + ".TW" (e.g., 2330.TW).
+    4. **Cryptocurrencies**: MUST end with "-USD" (e.g., ETH-USD, BTC-USD).
+    5. **US Stocks**: Ticker only (e.g., NVDA, TSLA).
     
-    JSON Schema:
-    {{
-        "ticker": "string",
-        "name": "string (Traditional Chinese preferred)",
-        "type": "string (one of: 'TW Stock', 'US Stock', 'Crypto')"
-    }}
+    Output Format:
+    Return ONLY a single valid JSON object. Do NOT write "json" or markdown blocks.
+    
+    Examples:
+    - Input: "台積電" -> {{"ticker": "2330.TW", "name": "TSMC", "type": "TW Stock"}}
+    - Input: "以太幣" -> {{"ticker": "ETH-USD", "name": "Ethereum", "type": "Crypto"}}
+    - Input: "台達電" -> {{"ticker": "2308.TW", "name": "Delta Electronics", "type": "TW Stock"}}
     """
     
     try:
-        response = model.generate_content(prompt)
+        # 使用 temperature=0 降低 AI 的「創造力」(幻覺)，讓它更精準
+        response = model.generate_content(prompt, generation_config=genai.types.GenerationConfig(temperature=0.0))
         text = response.text.strip()
         
-        # ★ 關鍵修改：使用 Regex 暴力提取 JSON
-        # 就算 AI 回傳 "Here is the code: ```json {...} ```"，我們也能精準抓到 {...}
+        # 暴力清洗：只保留 { 到 } 之間的內容
         match = re.search(r'\{.*\}', text, re.DOTALL)
-        
         if match:
             json_str = match.group()
             return json.loads(json_str)
         else:
-            return None # 真的找不到 JSON 格式
+            # 如果失敗，回傳原始文字以便除錯
+            return {"error": "format_error", "raw_text": text}
             
     except Exception as e:
-        print(f"AI Error: {e}")
-        return None
-
+        return {"error": "api_error", "msg": str(e)}
+        
 # --- 3. 資料庫操作 ---
 def load_portfolio():
     worksheet = get_google_sheet_connection()
@@ -114,50 +114,87 @@ with st.sidebar:
 
 df_portfolio = load_portfolio()
 
-# --- 模式 A: 智慧交易 ---
+# --- 模式 A: 智慧交易 (v9 自動救援版) ---
 if mode == "📝 智慧交易":
     st.subheader("新增交易")
-    query = st.text_input("輸入名稱或代號", placeholder="例如：玉山金, 2330")
+    st.caption("✨ 支援：以太幣、台達電、0050")
+    
+    query = st.text_input("輸入名稱或代號", placeholder="例如：台達電")
     
     found_ticker, found_name, found_type, current_price = None, "", "TW Stock", 0.0
 
     if query:
-        with st.spinner("AI 識別中..."):
+        with st.spinner("AI 識別與查價中..."):
             ai_result = identify_stock_with_ai(query)
             
-            if ai_result:
-                found_ticker = ai_result['ticker']
+            # 1. 檢查 AI 是否回傳錯誤
+            if not ai_result:
+                st.error("AI 罷工了，沒有回傳任何東西。")
+            elif "error" in ai_result:
+                st.error(f"AI 識別失敗。它回傳了：{ai_result.get('raw_text', '')}")
+                st.caption("建議：試著輸入更精確的名稱")
+            else:
+                # AI 成功回傳 JSON
+                ticker_candidate = ai_result['ticker']
                 found_name = ai_result['name']
                 found_type = ai_result['type']
                 
-                # 1. 獨立抓取 K 線圖 (確保圖表優先顯示)
-                try:
-                    # 使用 yf.download 抓歷史資料比較穩
-                    hist_data = yf.download(found_ticker, period="3mo", progress=False)
-                    # 處理 MultiIndex (yfinance 新版問題)
-                    if isinstance(hist_data.columns, pd.MultiIndex):
-                        hist_data.columns = hist_data.columns.get_level_values(0)
+                # ★ 2. 雙重市場偵測 (.TW vs .TWO)
+                # 很多時候 AI 給 6510.TW (錯)，其實應該是 6510.TWO (對)
+                # 我們建立一個測試清單，依序嘗試
+                tickers_to_try = [ticker_candidate]
+                if ticker_candidate.endswith(".TW"):
+                    tickers_to_try.append(ticker_candidate.replace(".TW", ".TWO"))
+                
+                valid_ticker = None
+                
+                for t in tickers_to_try:
+                    try:
+                        stock = yf.Ticker(t)
+                        # 試抓一天資料來驗證代號是否存在
+                        hist = stock.history(period="1d")
+                        if not hist.empty:
+                            valid_ticker = t
+                            current_price = float(hist['Close'].iloc[-1])
+                            
+                            # 畫圖
+                            hist_3mo = stock.history(period="3mo")
+                            fig = go.Figure(data=[go.Candlestick(
+                                x=hist_3mo.index,
+                                open=hist_3mo['Open'], high=hist_3mo['High'],
+                                low=hist_3mo['Low'], close=hist_3mo['Close']
+                            )])
+                            fig.update_layout(title=f"{found_name} ({valid_ticker})", height=300, margin=dict(t=30, b=0, l=0, r=0))
+                            st.plotly_chart(fig, use_container_width=True)
+                            
+                            st.success(f"✅ 成功鎖定：{found_name} ({valid_ticker}) | 現價：{current_price:.2f}")
+                            break # 找到了就跳出迴圈
+                    except:
+                        continue # 這個代號失敗，試下一個
+                
+                if valid_ticker:
+                    found_ticker = valid_ticker
+                else:
+                    st.warning(f"AI 建議代號 {ticker_candidate}，但 Yahoo Finance 抓不到資料。")
+                    st.caption("可能原因：這是上櫃股票但 AI 給了上市代號，或是該代號已下市。")
 
-                    if not hist_data.empty:
-                        fig = go.Figure(data=[go.Candlestick(
-                            x=hist_data.index,
-                            open=hist_data['Open'], high=hist_data['High'],
-                            low=hist_data['Low'], close=hist_data['Close']
-                        )])
-                        fig.update_layout(title=f"{found_name} ({found_ticker}) 近三個月走勢", height=300, margin=dict(l=20, r=20, t=30, b=20))
-                        st.plotly_chart(fig, use_container_width=True)
-                        
-                        # 順便更新現價
-                        current_price = float(hist_data['Close'].iloc[-1])
-                        st.success(f"✅ 識別成功：{found_name} | 參考現價：{current_price:.2f}")
-                    else:
-                        st.warning(f"識別為 {found_ticker} 但抓不到歷史股價")
-
-                except Exception as e:
-                    st.error(f"繪圖錯誤: {e}")
-
-            else:
-                st.error("AI 無法識別，請嘗試輸入更完整的名稱")
+    # 交易表單 (維持不變)
+    st.write("---")
+    with st.form("trade_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1: final_ticker = st.text_input("代號", value=found_ticker if found_ticker else "")
+        with c2: asset_type = st.selectbox("類型", ['TW Stock', 'US Stock', 'Crypto'], index=0)
+        with c3: input_price = st.number_input("單價", value=current_price)
+        shares = st.number_input("數量", step=0.01)
+        
+        if st.form_submit_button("送出"):
+            if final_ticker and shares != 0:
+                df = load_portfolio()
+                new_row = pd.DataFrame({'Ticker': [final_ticker], 'Type': [asset_type], 'Shares': [shares], 'Avg_Cost': [input_price]})
+                df = pd.concat([df, new_row], ignore_index=True)
+                save_portfolio(df)
+                st.toast("已儲存")
+                st.rerun()
 
     # 交易表單
     st.write("---")
