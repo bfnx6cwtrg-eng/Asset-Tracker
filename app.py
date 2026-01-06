@@ -225,20 +225,22 @@ if mode == "📝 智慧交易輸入":
             else:
                 st.error("請等待圖表顯示或輸入完整資訊")
 
-# --- 模式 B: 資產總覽 ---
+# --- 模式 B: 資產總覽 (修復 NaN 錯誤版) ---
 elif mode == "📊 資產總覽":
     if not df_portfolio.empty:
         tickers = df_portfolio['Ticker'].tolist() + ["TWD=X"]
         
         with st.spinner('更新最新報價...'):
             try:
-                # 批次抓取
-                market_data = yf.download(tickers, period="1d", progress=False)['Close']
+                # 1. 改良抓價：抓 5 天並向前填補 (避免週一早盤抓不到資料)
+                market_data = yf.download(tickers, period="5d", progress=False)['Close']
+                
                 # 處理 yfinance 新版格式問題
                 if isinstance(market_data.columns, pd.MultiIndex): 
                     market_data.columns = market_data.columns.get_level_values(0)
                 
-                current_prices = market_data.iloc[-1]
+                # 使用 ffill() 填補空值，取最後一筆非空資料
+                current_prices = market_data.ffill().iloc[-1]
                 usdtwd = current_prices.get('TWD=X', 32.5) # 預設防呆
 
                 results = []
@@ -247,7 +249,12 @@ elif mode == "📊 資產總覽":
                     shares = float(row['Shares'])
                     avg_cost = float(row['Avg_Cost'])
                     
+                    # ★ 防呆核心：先檢查是否為 NaN (Not a Number)
                     price = current_prices.get(ticker, 0)
+                    if pd.isna(price): 
+                        price = 0
+                        st.toast(f"⚠️ 警告: 抓不到 {ticker} 的價格，暫以 0 計算", icon="⚠️")
+                    
                     rate = usdtwd if row['Type'] in ['US Stock', 'Crypto'] else 1.0
                     
                     mkt_val = price * shares * rate
@@ -255,7 +262,17 @@ elif mode == "📊 資產總覽":
                     pl = mkt_val - cost
                     roi = (pl/cost)*100 if cost!=0 else 0
                     
-                    results.append({'代號': ticker, '類型': row['Type'], '市值': int(mkt_val), '損益': int(pl), '報酬率': roi})
+                    # ★ 轉換整數前，再次確認不是 NaN
+                    safe_mkt_val = int(mkt_val) if not pd.isna(mkt_val) else 0
+                    safe_pl = int(pl) if not pd.isna(pl) else 0
+                    
+                    results.append({
+                        '代號': ticker, 
+                        '類型': row['Type'], 
+                        '市值': safe_mkt_val, 
+                        '損益': safe_pl, 
+                        '報酬率': roi
+                    })
                 
                 df_res = pd.DataFrame(results)
                 
@@ -279,6 +296,8 @@ elif mode == "📊 資產總覽":
 
             except Exception as e:
                 st.error(f"報價錯誤: {e}")
+                # 顯示更詳細的錯誤以便除錯
+                st.write("Debug Info:", e)
     else:
         st.info("尚無資料，請到「智慧交易輸入」新增。")
 
