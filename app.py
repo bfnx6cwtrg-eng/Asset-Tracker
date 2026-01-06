@@ -68,7 +68,7 @@ def ask_gemini_analysis(df_display):
 
     # 3. 呼叫模型 (修正：使用正確的模型名稱)
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash') 
+        model = genai.GenerativeModel('gemini-3-flash-preview') 
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
