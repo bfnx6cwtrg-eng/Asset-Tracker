@@ -153,20 +153,38 @@ if mode == "📝 智慧交易輸入":
         # 1. 搜尋框
         user_input = st.text_input("輸入股票名稱或代號 (例如: 玉山金, 2330, NVDA)", placeholder="試試看輸入：玉山金")
         
-        # 2. 辨識邏輯
+       # --- 請替換 "智慧交易輸入" 裡面的搜尋邏輯 ---
+
+        # 2. 辨識邏輯 (升級版：支援模糊搜尋)
         if user_input:
             clean_input = user_input.strip()
-            # 查表
+            
+            # (A) 第一關：完全命中 (Exact Match) - 最快
             if clean_input in stock_map:
                 detected_ticker = stock_map[clean_input]
-            # 判斷是否為台股代號 (4碼數字)
+            
+            # (B) 第二關：台股代號 (4碼數字)
             elif clean_input.isdigit() and len(clean_input) == 4:
                 detected_ticker = f"{clean_input}.TW"
-            # 判斷是否為美股/Crypto (英文)
+            
+            # (C) 第三關：模糊搜尋 (Fuzzy Search) - 只要名字有包含就算
+            # 例如輸入 "玉山" -> 找到 "玉山金"
             else:
-                detected_ticker = clean_input.upper()
+                found = False
+                # 遍歷整個清單找有沒有「包含」這個關鍵字的
+                for name, code in stock_map.items():
+                    # 排除掉 key 是數字的情況，只找中文名
+                    if not name.isdigit() and clean_input in name:
+                        detected_ticker = code
+                        st.toast(f"💡 模糊搜尋：你是指 **{name}** 嗎？") # 貼心提示
+                        found = True
+                        break # 找到第一個就停
                 
-            st.info(f"🔍 辨識代號: **{detected_ticker}**")
+                # (D) 第四關：真的找不到，假設是美股代號
+                if not found:
+                    detected_ticker = clean_input.upper()
+                
+            st.info(f"🔍 系統辨識為: **{detected_ticker}**")
 
     # 3. K線圖預覽
     if detected_ticker:
