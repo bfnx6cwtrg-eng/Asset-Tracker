@@ -6,3 +6,5 @@ openpyxl
 gspread
 google-generativeai
 tabulate
+lxml
+html5lib
