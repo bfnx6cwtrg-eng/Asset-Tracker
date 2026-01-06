@@ -23,7 +23,7 @@ def get_google_sheet_connection():
 def get_gemini_model():
     try:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-        return genai.GenerativeModel('gemini-1.5-flash') # 用 Flash 處理這種小任務最快
+        return genai.GenerativeModel('gemini-3-flash-preview') # 用 Flash 處理這種小任務最快
     except:
         st.error("Secrets 設定錯誤：找不到 GEMINI_API_KEY")
         st.stop()
