@@ -6,6 +6,7 @@ import gspread
 import google.generativeai as genai
 import json
 import time
+import re
 
 # --- 設定 ---
 SHEET_NAME = "MyPortfolio"
@@ -29,28 +30,55 @@ def get_gemini_model():
         st.error("Secrets 設定錯誤：找不到 GEMINI_API_KEY")
         st.stop()
 
-# --- 2. 核心：AI 股票識別 ---
+# --- 2. 核心：AI 股票識別 (純 AI + 強力解析版) ---
 @st.cache_data(ttl=3600)
 def identify_stock_with_ai(query):
-    """輸入中文名，回傳標準代號"""
+    """輸入中文名，回傳標準代號 (純 AI 處理)"""
     if not query or str(query).lower() == "nan": return None
     
-    # 簡單防呆
-    if str(query).isdigit() and len(str(query)) == 4:
-        return {"ticker": f"{query}.TW", "name": str(query), "type": "TW Stock"}
+    # 簡單防呆：如果是 4 碼數字，直接當作台股 (這不算 VIP 名單，是基本邏輯)
+    q = str(query).strip()
+    if q.isdigit() and len(q) == 4:
+        return {"ticker": f"{q}.TW", "name": q, "type": "TW Stock"}
 
     model = get_gemini_model()
+    
+    # ★ 改良版 Prompt：嚴格規定格式，並教它 Crypto 要加 -USD
     prompt = f"""
-    Identify the financial asset: "{query}"
-    Return JSON with keys: "ticker" (Yahoo Finance format, e.g. 2330.TW), "name", "type".
-    If unsure, return null.
+    You are a financial symbol resolver. Convert the user input into a valid Yahoo Finance ticker.
+    
+    User Input: "{query}"
+    
+    Strict Rules:
+    1. For **Taiwan Stocks**, append ".TW" (e.g., 2330 -> 2330.TW).
+    2. For **Cryptocurrencies**, you MUST append "-USD" (e.g., ETH -> ETH-USD, BTC -> BTC-USD).
+    3. For **US Stocks**, use the standard ticker (e.g., NVDA, AAPL).
+    4. Return ONLY a valid JSON object. No markdown, no explanation.
+    
+    JSON Schema:
+    {{
+        "ticker": "string",
+        "name": "string (Traditional Chinese preferred)",
+        "type": "string (one of: 'TW Stock', 'US Stock', 'Crypto')"
+    }}
     """
+    
     try:
         response = model.generate_content(prompt)
-        text = response.text.strip().replace("```json", "").replace("```", "")
-        if "null" in text: return None
-        return json.loads(text)
-    except:
+        text = response.text.strip()
+        
+        # ★ 關鍵修改：使用 Regex 暴力提取 JSON
+        # 就算 AI 回傳 "Here is the code: ```json {...} ```"，我們也能精準抓到 {...}
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        
+        if match:
+            json_str = match.group()
+            return json.loads(json_str)
+        else:
+            return None # 真的找不到 JSON 格式
+            
+    except Exception as e:
+        print(f"AI Error: {e}")
         return None
 
 # --- 3. 資料庫操作 ---
