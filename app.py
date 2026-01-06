@@ -26,7 +26,7 @@ def get_gemini_model():
     try:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
         # 使用 temperature=0 讓 AI 回答更死板固定，減少幻覺
-        return genai.GenerativeModel('gemini-1.5-flash', generation_config={"temperature": 0.0})
+        return genai.GenerativeModel('gemini-2.5-flash', generation_config={"temperature": 0.0})
     except:
         st.error("Secrets 設定錯誤：找不到 GEMINI_API_KEY")
         st.stop()
