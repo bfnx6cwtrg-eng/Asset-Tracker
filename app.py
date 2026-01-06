@@ -3,50 +3,13 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import gspread
-import io
 import google.generativeai as genai
-from datetime import datetime, timedelta
+import json
 
 # --- 設定 ---
-SHEET_NAME = "MyPortfolio"  # 你的 Google Sheet 名稱
+SHEET_NAME = "MyPortfolio"
 
-# --- 0. 核心功能：台股代號對照表 (翻譯蒟蒻) ---
-@st.cache_data(ttl=86400) # 快取 24 小時，避免重複爬蟲
-def get_tw_stock_map():
-    """從網路抓取台股清單，建立 '中文 -> 代號' 的對照表"""
-    stock_map = {}
-    try:
-        # 抓上市
-        url_twse = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
-        df_twse = pd.read_html(url_twse, encoding='cp950')[0]
-        df_twse = df_twse.iloc[2:] # 去掉標頭
-        
-        for index, row in df_twse.iterrows():
-            code_name = str(row[0])
-            # 格式通常是 "2330 台積電"，我們把它拆開
-            if len(code_name.split()) >= 2:
-                parts = code_name.split()
-                code = parts[0]
-                name = parts[1]
-                # 建立對照
-                stock_map[name] = f"{code}.TW" # 輸入 "台積電"
-                stock_map[code] = f"{code}.TW" # 輸入 "2330"
-        
-        # 手動補充熱門美股與幣圈 (因為爬蟲抓不到這些)
-        custom_map = {
-            "NVDA": "NVDA", "輝達": "NVDA",
-            "AAPL": "AAPL", "蘋果": "AAPL", 
-            "TSLA": "TSLA", "特斯拉": "TSLA",
-            "ETH": "ETH-USD", "以太幣": "ETH-USD", "ETH-USD": "ETH-USD",
-            "BTC": "BTC-USD", "比特幣": "BTC-USD", "BTC-USD": "BTC-USD"
-        }
-        stock_map.update(custom_map)
-        return stock_map
-    except Exception as e:
-        print(f"抓取清單失敗: {e}") # 印在後台
-        return {}
-
-# --- 1. 連接 Google Sheets ---
+# --- 1. 連接 Google Sheets & Gemini ---
 def get_google_sheet_connection():
     try:
         credentials = dict(st.secrets["gcp_service_account"])
@@ -57,240 +20,192 @@ def get_google_sheet_connection():
         st.error(f"連線 Google Sheets 失敗: {e}")
         st.stop()
 
+def get_gemini_model():
+    try:
+        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+        return genai.GenerativeModel('gemini-1.5-flash') # 用 Flash 處理這種小任務最快
+    except:
+        st.error("Secrets 設定錯誤：找不到 GEMINI_API_KEY")
+        st.stop()
+
+# --- 2. 核心：AI 股票識別員 (取代舊的爬蟲) ---
+@st.cache_data(ttl=3600) # 快取 1 小時，同樣的搜尋不用一直問 AI
+def identify_stock_with_ai(query):
+    """
+    輸入：玉山 / 2330 / NVDA
+    輸出：{'ticker': '2884.TW', 'name': '玉山金', 'type': 'TW Stock'}
+    """
+    model = get_gemini_model()
+    prompt = f"""
+    User Input: "{query}"
+    
+    Task: Identify the financial asset based on the input.
+    Target Markets: Taiwan Stocks (TW), US Stocks, Cryptocurrencies.
+    
+    Return a pure JSON object with these keys:
+    - "ticker": The Yahoo Finance ticker symbol (e.g., "2330.TW", "NVDA", "ETH-USD").
+    - "name": The common company/asset name in Traditional Chinese (e.g., "台積電", "輝達", "以太幣").
+    - "type": One of ["TW Stock", "US Stock", "Crypto"].
+    
+    Rules:
+    - If user inputs a 4-digit number (e.g. 2884), assume Taiwan Stock (add .TW).
+    - If input is ambiguous but looks like a company name, output the most likely stock.
+    - If input is unrecognizable, return "null".
+    - Do NOT output markdown formatting (like ```json), just the raw JSON string.
+    """
+    try:
+        response = model.generate_content(prompt)
+        text = response.text.strip().replace("```json", "").replace("```", "")
+        if "null" in text: return None
+        return json.loads(text)
+    except:
+        return None
+
+# --- 3. 資料庫操作 ---
 def load_portfolio():
     worksheet = get_google_sheet_connection()
     try:
         data = worksheet.get_all_records()
-        if not data:
-            return pd.DataFrame(columns=['Ticker', 'Type', 'Shares', 'Avg_Cost'])
+        if not data: return pd.DataFrame(columns=['Ticker', 'Type', 'Shares', 'Avg_Cost'])
         df = pd.DataFrame(data)
-        
-        # 欄位防呆
-        required_cols = ['Ticker', 'Type', 'Shares', 'Avg_Cost']
-        for col in required_cols:
-            if col not in df.columns:
-                df[col] = 0.0 if col == 'Avg_Cost' else ""
-        
-        # ★ 重要資料清洗：讀取時把單引號拿掉
-        # Google Sheet 裡存的是 "'2330.TW"，讀出來要變回 "2330.TW"
-        df['Ticker'] = df['Ticker'].astype(str).str.replace("'", "")
-        
+        # 清洗 Ticker 防止單引號問題
+        if 'Ticker' in df.columns:
+            df['Ticker'] = df['Ticker'].astype(str).str.replace("'", "")
         return df
-    except gspread.exceptions.WorksheetNotFound:
-        st.error("找不到工作表")
-        st.stop()
+    except:
+        return pd.DataFrame()
 
 def save_portfolio(df):
     worksheet = get_google_sheet_connection()
     worksheet.clear()
-    
-    # ★ 重要優化：寫入時加上單引號，防止 Google Sheet 變成超連結
-    # 先複製一份以免影響當下顯示
     df_save = df.copy()
+    # 寫入時加單引號防止轉連結
     df_save['Ticker'] = df_save['Ticker'].astype(str).apply(lambda x: f"'{x}" if x and not x.startswith("'") else x)
-    
-    # 寫入
     worksheet.update([df_save.columns.values.tolist()] + df_save.values.tolist())
 
-# --- 2. AI 分析核心 ---
-def ask_gemini_analysis(df_display):
-    try:
-        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-        data_str = df_display.to_markdown(index=False)
-        prompt = f"""
-        你是一位專業財務顧問。請分析以下投資組合(TWD)：
-        {data_str}
-        請給出：1.資產配置評語 2.風險警告(集中度/波動) 3.具體行動建議。
-        請用條列式，語氣專業。
-        """
-        # 使用你指定的最新模型
-        model = genai.GenerativeModel('gemini-3-flash-preview') 
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"AI 發生錯誤: {e}"
+# --- 4. 頁面 UI ---
+st.set_page_config(page_title="AI Asset Tracker", layout="wide", page_icon="🤖")
+st.title("🤖 AI 智慧資產追蹤")
 
-# --- Excel 匯入 (維持簡化版) ---
-def process_uploaded_file(uploaded_file):
-    try:
-        df_new = pd.read_excel(uploaded_file)
-        # 簡易清洗邏輯 (略，與之前相同)
-        return df_new, "Success"
-    except Exception as e:
-        return None, str(e)
-
-# --- 主程式頁面 UI ---
-st.set_page_config(page_title="Smart Asset Tracker", layout="wide", page_icon="📈")
-st.title("📈 智慧資產追蹤 (全功能版)")
-
-# 初始化：載入股票對照表
-with st.spinner("正在更新股票清單..."):
-    stock_map = get_tw_stock_map()
-
-# 側邊欄
 with st.sidebar:
-    st.header("功能選單")
-    mode = st.radio("", ["📊 資產總覽", "📝 智慧交易輸入", "📂 資料管理"])
+    mode = st.radio("選單", ["📊 資產總覽", "📝 智慧交易", "📂 資料管理"])
     st.divider()
-    bank_balance = st.number_input("銀行現金餘額", value=150000, step=1000)
-    monthly_expense = st.number_input("本月累積花費", value=12000, step=500)
+    bank_balance = st.number_input("銀行餘額", value=150000, step=1000)
+    monthly_expense = st.number_input("本月花費", value=12000, step=500)
 
-# 讀取資料
-try:
-    df_portfolio = load_portfolio()
-except:
-    df_portfolio = pd.DataFrame()
+df_portfolio = load_portfolio()
 
-# --- 模式 A: 智慧交易輸入 (你的新需求) ---
-if mode == "📝 智慧交易輸入":
-    st.subheader("新增交易 (支援中文搜尋)")
+# --- 模式 A: 智慧交易 (大幅升級) ---
+if mode == "📝 智慧交易":
+    st.subheader("新增交易")
+    st.caption("✨ 支援模糊搜尋：試試輸入「玉山」、「鴻海」或「Bitcoin」")
     
-    col1, col2 = st.columns([2, 1])
+    # 1. 搜尋輸入
+    query = st.text_input("輸入名稱或代號", placeholder="例如：玉山金, 2330, AAPL")
     
-    detected_ticker = None
-    
-    with col1:
-        # 1. 搜尋框
-        user_input = st.text_input("輸入股票名稱或代號 (例如: 玉山金, 2330, NVDA)", placeholder="試試看輸入：玉山金")
-        
-       # --- 請替換 "智慧交易輸入" 裡面的搜尋邏輯 ---
+    # 初始化變數
+    found_ticker = None
+    found_name = ""
+    found_type = "TW Stock"
+    current_price = 0.0
 
-        # 2. 辨識邏輯 (升級版：支援模糊搜尋)
-        if user_input:
-            clean_input = user_input.strip()
+    # 2. AI 辨識 + yfinance 查價
+    if query:
+        with st.spinner("AI 正在識別並抓取即時報價..."):
+            # Step A: 問 AI 這是什麼
+            ai_result = identify_stock_with_ai(query)
             
-            # (A) 第一關：完全命中 (Exact Match) - 最快
-            if clean_input in stock_map:
-                detected_ticker = stock_map[clean_input]
-            
-            # (B) 第二關：台股代號 (4碼數字)
-            elif clean_input.isdigit() and len(clean_input) == 4:
-                detected_ticker = f"{clean_input}.TW"
-            
-            # (C) 第三關：模糊搜尋 (Fuzzy Search) - 只要名字有包含就算
-            # 例如輸入 "玉山" -> 找到 "玉山金"
+            if ai_result:
+                found_ticker = ai_result['ticker']
+                found_name = ai_result['name']
+                found_type = ai_result['type']
+                
+                # Step B: 問 yfinance 現在多少錢
+                try:
+                    stock = yf.Ticker(found_ticker)
+                    # 嘗試取得最新價 (相容性寫法)
+                    price_info = stock.fast_info
+                    if hasattr(price_info, 'last_price') and price_info.last_price:
+                        current_price = float(price_info.last_price)
+                    else:
+                         # 備用方案: 抓 1 天歷史
+                        hist = stock.history(period="1d")
+                        if not hist.empty:
+                            current_price = float(hist['Close'].iloc[-1])
+                    
+                    # 顯示成功訊息
+                    st.success(f"✅ 識別成功：**{found_name} ({found_ticker})** | 現價：**{current_price:,.2f}**")
+                    
+                    # 畫 K 線圖
+                    hist_data = stock.history(period="3mo")
+                    if not hist_data.empty:
+                        fig = go.Figure(data=[go.Candlestick(
+                            x=hist_data.index,
+                            open=hist_data['Open'], high=hist_data['High'],
+                            low=hist_data['Low'], close=hist_data['Close']
+                        )])
+                        fig.update_layout(title=f"{found_name} 近三個月走勢", height=300, margin=dict(l=20, r=20, t=30, b=20))
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                except Exception as e:
+                    st.warning(f"已識別代號 {found_ticker}，但抓取股價失敗。")
             else:
-                found = False
-                # 遍歷整個清單找有沒有「包含」這個關鍵字的
-                for name, code in stock_map.items():
-                    # 排除掉 key 是數字的情況，只找中文名
-                    if not name.isdigit() and clean_input in name:
-                        detected_ticker = code
-                        st.toast(f"💡 模糊搜尋：你是指 **{name}** 嗎？") # 貼心提示
-                        found = True
-                        break # 找到第一個就停
-                
-                # (D) 第四關：真的找不到，假設是美股代號
-                if not found:
-                    detected_ticker = clean_input.upper()
-                
-            st.info(f"🔍 系統辨識為: **{detected_ticker}**")
+                st.error("AI 無法識別此資產，請嘗試輸入完整代號 (如 2330.TW)。")
 
-    # 3. K線圖預覽
-    if detected_ticker:
-        with st.spinner(f"正在抓取 {detected_ticker} 走勢圖..."):
-            try:
-                # 抓 3 個月資料
-                chart_data = yf.download(detected_ticker, period="3mo", progress=False)
-                
-                if not chart_data.empty:
-                    # 處理 MultiIndex (yfinance 新版問題)
-                    if isinstance(chart_data.columns, pd.MultiIndex):
-                        chart_data.columns = chart_data.columns.get_level_values(0)
-
-                    fig = go.Figure(data=[go.Candlestick(
-                        x=chart_data.index,
-                        open=chart_data['Open'],
-                        high=chart_data['High'],
-                        low=chart_data['Low'],
-                        close=chart_data['Close']
-                    )])
-                    fig.update_layout(title=f"{detected_ticker} 近三個月走勢", height=350, margin=dict(l=20, r=20, t=30, b=20))
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.warning(f"⚠️ 找不到 {detected_ticker} 的資料，請確認代號是否正確。")
-                    detected_ticker = None
-            except Exception as e:
-                st.error(f"繪圖失敗: {e}")
-
-    # 4. 確認與送出
+    # 3. 交易表單 (自動帶入 AI 查到的資料)
+    st.write("---")
     with st.form("trade_form"):
-        st.write("---")
-        st.write("#### 確認交易細節")
         c1, c2, c3 = st.columns(3)
         with c1:
-            # 這裡自動帶入辨識出的代號
-            final_ticker = st.text_input("確認代號", value=detected_ticker if detected_ticker else "")
+            # 自動填入 Ticker
+            final_ticker = st.text_input("確認代號", value=found_ticker if found_ticker else "")
         with c2:
-            asset_type = st.selectbox("資產類型", ['TW Stock', 'US Stock', 'Crypto'])
+            # 自動填入類型
+            asset_type = st.selectbox("資產類型", ['TW Stock', 'US Stock', 'Crypto'], 
+                                    index=['TW Stock', 'US Stock', 'Crypto'].index(found_type) if found_type in ['TW Stock', 'US Stock', 'Crypto'] else 0)
         with c3:
-            price = st.number_input("成交單價", min_value=0.0)
+            # ★ 自動填入股價 (這是你要的功能!)
+            input_price = st.number_input("成交單價", min_value=0.0, value=current_price, step=0.5)
         
-        shares = st.number_input("交易數量 (+買進 / -賣出)", step=0.01)
+        shares = st.number_input("數量 (+買 / -賣)", step=0.01)
         
         if st.form_submit_button("送出交易"):
             if final_ticker and shares != 0:
-                final_ticker = final_ticker.strip().upper()
-                
-                # 載入 -> 新增 -> 儲存
                 df = load_portfolio()
-                new_row = pd.DataFrame({'Ticker': [final_ticker], 'Type': [asset_type], 'Shares': [shares], 'Avg_Cost': [price]})
+                new_row = pd.DataFrame({'Ticker': [final_ticker], 'Type': [asset_type], 'Shares': [shares], 'Avg_Cost': [input_price]})
                 df = pd.concat([df, new_row], ignore_index=True)
-                
-                save_portfolio(df) # 這裡會自動處理單引號
-                st.success(f"✅ 已寫入: {final_ticker}")
+                save_portfolio(df)
+                st.toast(f"🎉 交易已記錄：{found_name}")
                 st.rerun()
-            else:
-                st.error("請等待圖表顯示或輸入完整資訊")
 
-# --- 模式 B: 資產總覽 (修復 NaN 錯誤版) ---
+# --- 模式 B: 資產總覽 (維持穩定版) ---
 elif mode == "📊 資產總覽":
     if not df_portfolio.empty:
         tickers = df_portfolio['Ticker'].tolist() + ["TWD=X"]
-        
-        with st.spinner('更新最新報價...'):
+        with st.spinner('更新報價中...'):
             try:
-                # 1. 改良抓價：抓 5 天並向前填補 (避免週一早盤抓不到資料)
+                # 抓 5 天防止 NaN
                 market_data = yf.download(tickers, period="5d", progress=False)['Close']
-                
-                # 處理 yfinance 新版格式問題
-                if isinstance(market_data.columns, pd.MultiIndex): 
-                    market_data.columns = market_data.columns.get_level_values(0)
-                
-                # 使用 ffill() 填補空值，取最後一筆非空資料
+                if isinstance(market_data.columns, pd.MultiIndex): market_data.columns = market_data.columns.get_level_values(0)
                 current_prices = market_data.ffill().iloc[-1]
-                usdtwd = current_prices.get('TWD=X', 32.5) # 預設防呆
+                usdtwd = current_prices.get('TWD=X', 32.5)
 
                 results = []
                 for index, row in df_portfolio.iterrows():
-                    ticker = str(row['Ticker'])
-                    shares = float(row['Shares'])
-                    avg_cost = float(row['Avg_Cost'])
-                    
-                    # ★ 防呆核心：先檢查是否為 NaN (Not a Number)
-                    price = current_prices.get(ticker, 0)
-                    if pd.isna(price): 
-                        price = 0
-                        st.toast(f"⚠️ 警告: 抓不到 {ticker} 的價格，暫以 0 計算", icon="⚠️")
+                    t = str(row['Ticker'])
+                    s = float(row['Shares'])
+                    c = float(row['Avg_Cost'])
+                    # 價格防呆
+                    p = current_prices.get(t, 0)
+                    if pd.isna(p): p = 0
                     
                     rate = usdtwd if row['Type'] in ['US Stock', 'Crypto'] else 1.0
-                    
-                    mkt_val = price * shares * rate
-                    cost = avg_cost * shares * rate
-                    pl = mkt_val - cost
+                    val = p * s * rate
+                    cost = c * s * rate
+                    pl = val - cost
                     roi = (pl/cost)*100 if cost!=0 else 0
                     
-                    # ★ 轉換整數前，再次確認不是 NaN
-                    safe_mkt_val = int(mkt_val) if not pd.isna(mkt_val) else 0
-                    safe_pl = int(pl) if not pd.isna(pl) else 0
-                    
-                    results.append({
-                        '代號': ticker, 
-                        '類型': row['Type'], 
-                        '市值': safe_mkt_val, 
-                        '損益': safe_pl, 
-                        '報酬率': roi
-                    })
+                    results.append({'代號': t, '類型': row['Type'], '市值': int(val), '損益': int(pl), '報酬率': roi})
                 
                 df_res = pd.DataFrame(results)
                 
@@ -298,28 +213,26 @@ elif mode == "📊 資產總覽":
                 total = df_res['市值'].sum() + bank_balance - monthly_expense
                 pl_total = df_res['損益'].sum()
                 
-                k1, k2, k3 = st.columns(3)
-                k1.metric("總資產", f"${total:,.0f}")
-                k2.metric("總損益", f"${pl_total:+,.0f}")
-                k3.metric("現金水位", f"${(bank_balance-monthly_expense):,.0f}")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("總資產", f"${total:,.0f}")
+                col2.metric("總損益", f"${pl_total:+,.0f}")
+                col3.metric("現金", f"${(bank_balance-monthly_expense):,.0f}")
                 
                 st.dataframe(df_res.style.format({'市值': "{:,}", '損益': "{:+}", '報酬率': "{:+.2f}%"}))
                 
-                # AI 按鈕
+                # AI 分析
                 st.markdown("---")
-                if st.button("🤖 讓 Gemini 分析資產配置", type="primary"):
-                    with st.spinner("AI 分析中..."):
-                        ai_df = df_res[['代號', '類型', '市值', '報酬率']]
-                        st.markdown(ask_gemini_analysis(ai_df))
+                if st.button("🤖 AI 投資診斷"):
+                    with st.spinner("Gemini 思考中..."):
+                        # AI 分析部分
+                        model = get_gemini_model()
+                        prompt = f"分析投資組合(TWD): {df_res[['代號','市值','報酬率']].to_markdown()}. 給出配置建議與風險。"
+                        st.markdown(model.generate_content(prompt).text)
 
             except Exception as e:
                 st.error(f"報價錯誤: {e}")
-                # 顯示更詳細的錯誤以便除錯
-                st.write("Debug Info:", e)
     else:
-        st.info("尚無資料，請到「智慧交易輸入」新增。")
+        st.info("尚無資料")
 
-# --- 模式 C: 資料管理 ---
 elif mode == "📂 資料管理":
-    st.info("若需批次匯入 Excel，請使用 v5 版本代碼，或直接在「智慧交易」逐筆輸入。")
-    # 如果你很需要 Excel 匯入，我可以再把那段加回來，但目前建議先測試新功能
+    st.info("請直接使用「智慧交易」功能進行管理。")
