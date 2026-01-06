@@ -25,7 +25,7 @@ def get_google_sheet_connection():
 def get_gemini_model():
     try:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-        return genai.GenerativeModel('gemini-1.5-flash')
+        return genai.GenerativeModel('gemini-2.5-flash-lite')
     except:
         st.error("Secrets 設定錯誤：找不到 GEMINI_API_KEY")
         st.stop()
